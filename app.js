@@ -509,7 +509,7 @@ function FlagStage() {
       const c = S.current;
       stage.append(el('div', { class: 'label', style: 'text-align:center;margin-top:16px' }, `${c.cap} · ${c.name}`));
       const wrap = el('div', { class: 'citymapwrap' });
-      wrap.append(worldMap({ highlight: c.code, view: frameView(c.geometry, 0.85, 80), marker: c.capll ? { ll: c.capll, label: c.cap } : null }));
+      wrap.append(worldMap({ highlight: c.code, view: frameView(c.geometry, 0.45, 55), marker: c.capll ? { ll: c.capll, label: c.cap } : null }));
       stage.append(wrap);
     }
   } else stage.append(TypeInput('typebox'));
