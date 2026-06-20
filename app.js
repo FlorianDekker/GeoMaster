@@ -118,7 +118,8 @@ function buildMap() {
   }
   return svg;
 }
-function worldMap({ highlight = null, view = null, fit = 'meet' } = {}) {
+const SVGNS = 'http://www.w3.org/2000/svg';
+function worldMap({ highlight = null, view = null, fit = 'meet', marker = null } = {}) {
   const svg = mapTemplate.cloneNode(true);
   if (highlight) {
     const t = svg.querySelector(`[data-code="${highlight}"]`);
@@ -127,6 +128,22 @@ function worldMap({ highlight = null, view = null, fit = 'meet' } = {}) {
   if (view) {
     svg.setAttribute('viewBox', `${view.x} ${view.y} ${view.w} ${view.h}`);
     svg.setAttribute('preserveAspectRatio', 'xMidYMid ' + fit);
+  }
+  if (marker && marker.ll) {
+    const [lat, lng] = marker.ll, [x, y] = project([lng, lat]);
+    const span = view ? Math.max(view.w, view.h) : W;
+    const r = span * 0.02;
+    const dot = document.createElementNS(SVGNS, 'circle');
+    dot.setAttribute('cx', x); dot.setAttribute('cy', y); dot.setAttribute('r', r);
+    dot.setAttribute('class', 'citydot');
+    svg.append(dot);
+    if (marker.label) {
+      const tx = document.createElementNS(SVGNS, 'text');
+      tx.setAttribute('x', x + r * 1.5); tx.setAttribute('y', y + r * 0.5);
+      tx.setAttribute('font-size', span * 0.05); tx.setAttribute('class', 'citylbl');
+      tx.textContent = marker.label;
+      svg.append(tx);
+    }
   }
   return svg;
 }
@@ -179,9 +196,12 @@ async function loadData() {
     code = code.toLowerCase();
     const aliases = new Set([p.NAME, p.NAME_LONG, p.NAME_EN, p.NAME_CIAWF, p.NAME_SORT].map(norm).filter(Boolean));
     (EXTRA_ALIASES[code] || []).forEach(a => aliases.add(norm(a)));
+    const ce = caps[code];
+    const cap = ce ? (typeof ce === 'string' ? ce : ce.n) : null;
+    const capll = (ce && typeof ce === 'object' && ce.ll) ? ce.ll : null;
     raw.push({
       code, name: p.NAME_LONG || p.NAME, region: p.CONTINENT, aliases: [...aliases],
-      cap: caps[code] || null, pop: +p.POP_EST || 0, label: +p.LABELRANK || 5, geometry: f.geometry,
+      cap, capll, pop: +p.POP_EST || 0, label: +p.LABELRANK || 5, geometry: f.geometry,
     });
   }
   const logs = raw.map(c => Math.log10(c.pop + 1));
@@ -310,7 +330,8 @@ function answer(correct) {
     S.lives--; S.streak = 0; S.missed.push(S.current); S.feedback = { ok: false };
   }
   render();
-  if (correct && S.mode !== 'map') S.advTimer = setTimeout(() => { S.advTimer = null; next(); }, AUTO_ADVANCE_MS);
+  // auto-advance only for the fast flag modes; capital & map stay so you can study the location
+  if (correct && (S.mode === 'mc' || S.mode === 'type')) S.advTimer = setTimeout(() => { S.advTimer = null; next(); }, AUTO_ADVANCE_MS);
 }
 function next() {
   clearAdv();
@@ -484,6 +505,13 @@ function FlagStage() {
       else if (S.locked) cls = o.code === S.current.code ? 'opt right' : o.code === S.chosen ? 'opt wrong' : 'opt dim';
       return el('div', { class: cls, onclick: () => chooseMC(o) }, optLabel(o));
     })));
+    if (S.mode === 'capital' && S.locked) {
+      const c = S.current;
+      stage.append(el('div', { class: 'label', style: 'text-align:center;margin-top:16px' }, `${c.cap} · ${c.name}`));
+      const wrap = el('div', { class: 'citymapwrap' });
+      wrap.append(worldMap({ highlight: c.code, view: frameView(c.geometry, 1.6, 110), marker: c.capll ? { ll: c.capll, label: c.cap } : null }));
+      stage.append(wrap);
+    }
   } else stage.append(TypeInput('typebox'));
   return stage;
 }
@@ -601,7 +629,7 @@ function Learn() {
         el('div', {}, [el('span', {}, 'RESULT'), el('b', {}, ok ? (L.firstTry && !L.viaShow && L.override == null ? '✓ mastered' : '✓ knew it') : '✗ review')]),
       ]),
     ]));
-    if (S.learnMode !== 'map') { const mm = el('div', { class: 'minimap' }); mm.append(worldMap({ highlight: c.code, view: frameView(c.geometry, 1.8, 110) })); card.append(mm); }
+    if (S.learnMode !== 'map') { const mm = el('div', { class: 'minimap' }); mm.append(worldMap({ highlight: c.code, view: frameView(c.geometry, 1.8, 110), marker: (S.learnMode === 'capitals' && c.capll) ? { ll: c.capll, label: c.cap } : null })); card.append(mm); }
     card.append(el('div', { class: 'learnbtns' }, [el('button', { class: 'showbtn tap', onclick: () => { L.override = !ok; render(); } }, ok ? 'Mark wrong' : 'I knew it'), el('button', { class: 'checkbtn tap', style: 'flex:1', onclick: learnNext }, 'Next →')]));
   }
   return el('div', { class: 'learn' }, [head, card]);

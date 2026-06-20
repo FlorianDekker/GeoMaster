@@ -136,6 +136,10 @@ input{font-family:'Fredoka';}
 .hero .country{fill:#c4ccf2;}
 .minimap .country,.mapstage .country{fill:#bcd8ec;stroke:#eaf5fd;stroke-width:.7;}
 .minimap .country.hl,.mapstage .country.hl{fill:var(--purple);stroke:#fff;stroke-width:1.4;}
+.citydot{fill:#FF3B6B;stroke:#fff;stroke-width:2;vector-effect:non-scaling-stroke;}
+.citylbl{font-family:'Fredoka';font-weight:600;fill:#1E2150;paint-order:stroke;stroke:#fff;stroke-width:3px;stroke-linejoin:round;vector-effect:non-scaling-stroke;}
+.citymapwrap{margin-top:10px;height:190px;border-radius:16px;overflow:hidden;background:#D8ECFA;border:2px solid var(--soft);}
+.citymapwrap svg{width:100%;height:100%;display:block;}
 
 /* ===== RESULTS ===== */
 .results{flex:1;display:flex;flex-direction:column;min-height:0;padding:18px 22px calc(22px + env(safe-area-inset-bottom));}
