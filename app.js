@@ -293,7 +293,7 @@ function loadNext() {
   let options = [];
   if (isMC()) options = shuffle([current, ...pickDistractors(current, 3, S.mode === 'capital')]);
   Object.assign(S, { current, options, chosen: null, typed: '', feedback: null, locked: false, timeLeft: TIME_PER_Q, fiftyUsedThisQ: false, hidden: [] });
-  if (S.mode === 'map') { const dv = frameView(current.geometry); S.mapDefault = dv; S.mapView = { ...dv }; }
+  if (S.mode === 'map') { const dv = frameView(current.geometry, 2.2, 150); S.mapDefault = dv; S.mapView = { ...dv }; }
   render();
   startTimer();
   if (isTextEntry()) setTimeout(() => { const i = $('.tinput'); if (i) i.focus(); }, 60);
