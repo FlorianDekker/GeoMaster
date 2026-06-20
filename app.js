@@ -94,7 +94,7 @@ function worldMap({ highlight = null, zoom = false } = {}) {
 /* ---------- data load ---------- */
 async function loadData() {
   const caps = window.GEO_CAPITALS || {};
-  const res = await fetch('world.geojson');
+  const res = await fetch('world.geojson?v=2');
   const json = await res.json();
   for (const f of json.features) {
     const p = f.properties;
