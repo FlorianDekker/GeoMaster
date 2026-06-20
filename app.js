@@ -16,10 +16,16 @@ const el = (tag, props = {}, kids = []) => {
 const flag = (code, w = 320) => `https://flagcdn.com/w${w}/${code}.png`;
 const norm = s => (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z]/g, '');
 const shuffle = a => { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [a[i], a[j]] = [a[j], a[i]]; } return a; };
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const icon = p => `<svg viewBox="0 0 24 24" width="100%" height="100%" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
-const fmtPop = n => (n && n > 0) ? Number(n).toLocaleString('en-US') : '—';
+function fmtPop(n) {
+  if (!n || n <= 0) return '—';
+  try { return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(n).toLowerCase(); }
+  catch { return Number(n).toLocaleString('en-US'); }
+}
 
 const REGIONS = ['All', 'Europe', 'Asia', 'Africa', 'North America', 'South America', 'Oceania'];
+const DIFFS = ['All', 'Easy', 'Medium', 'Hard'];
 const MODES = { mc: 'Choice', type: 'Type', capital: 'Capital', map: 'Map' };
 const SKIP_CONTINENT = new Set(['Antarctica', 'Seven seas (open ocean)']);
 const EXTRA_ALIASES = {
@@ -30,14 +36,19 @@ const EXTRA_ALIASES = {
   mk: ['macedonia'], tl: ['easttimor'], la: ['laos'], bn: ['brunei'], tz: ['tanzania'],
 };
 const TIME_PER_Q = 20;
-const AUTO_ADVANCE_MS = 2000;
-const HS_KEY = 'geomaster.high';
+const AUTO_ADVANCE_MS = 1500;
+const FIFTY_PER_ROUND = 3;
+const W_POP = 0.6, W_LABEL = 0.4;            // difficulty blend weights
+const LEARN_ACTIVE = 8;                       // max countries in rotation at once
+const LEARN_INTERVALS = [3, 6, 12, 25, 50];   // cards until a box-N country returns
+const MASTER_BOX = 5;
+const HS_KEY = 'geomaster.high', STATS_KEY = 'geomaster.stats', MASTERY_KEY = 'geomaster.mastery';
 
-let GEO = [];           // {code,name,region,aliases[],cap,pop,geometry}
-let byCode = {};        // code -> country
-let mapTemplate = null; // <svg> built once
+let GEO = [];           // {code,name,region,aliases[],cap,pop,prom,geometry}
+let byCode = {};
+let mapTemplate = null;
 
-/* ---------- map rendering (equirectangular) ---------- */
+/* ---------- map projection ---------- */
 const W = 1000, H = 500;
 const project = ([lon, lat]) => [((lon + 180) / 360) * W, ((90 - lat) / 180) * H];
 function ringPath(ring) {
@@ -58,6 +69,15 @@ function bbox(geom) {
   }
   return [mnx, mny, mxx, mxy];
 }
+function frameView(geom, zoomFactor = 1.1, min = 70) {
+  const [mnx, mny, mxx, mxy] = bbox(geom);
+  let w = mxx - mnx, h = mxy - mny;
+  const pad = Math.max(w, h) * zoomFactor + 10;
+  let x = mnx - pad, y = mny - pad; w += 2 * pad; h += 2 * pad;
+  if (w < min) { x -= (min - w) / 2; w = min; }
+  if (h < min) { y -= (min - h) / 2; h = min; }
+  return { x, y, w, h };
+}
 function buildMap() {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
@@ -71,31 +91,57 @@ function buildMap() {
   }
   return svg;
 }
-function worldMap({ highlight = null, zoom = false } = {}) {
+function worldMap({ highlight = null, view = null } = {}) {
   const svg = mapTemplate.cloneNode(true);
   if (highlight) {
     const t = svg.querySelector(`[data-code="${highlight}"]`);
-    if (t) { t.classList.add('hl'); svg.append(t); }          // raise to top
-    if (zoom && byCode[highlight]) {
-      const [mnx, mny, mxx, mxy] = bbox(byCode[highlight].geometry);
-      let w = mxx - mnx, h = mxy - mny;
-      const pad = Math.max(w, h) * 0.55 + 6;
-      let vx = mnx - pad, vy = mny - pad, vw = w + 2 * pad, vh = h + 2 * pad;
-      const MIN = 34;                                          // don't over-zoom tiny states
-      if (vw < MIN) { vx -= (MIN - vw) / 2; vw = MIN; }
-      if (vh < MIN) { vy -= (MIN - vh) / 2; vh = MIN; }
-      svg.setAttribute('viewBox', `${vx.toFixed(1)} ${vy.toFixed(1)} ${vw.toFixed(1)} ${vh.toFixed(1)}`);
-      svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
-    }
+    if (t) { t.classList.add('hl'); svg.append(t); }
+  }
+  if (view) {
+    svg.setAttribute('viewBox', `${view.x} ${view.y} ${view.w} ${view.h}`);
+    svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
   }
   return svg;
+}
+/* interactive pan/zoom on a viewBox object (mutated in place) */
+const MIN_W = 8, MAX_W = 1400;
+const viewScale = (rect, v) => Math.min(rect.width / v.w, rect.height / v.h);
+function clientToUnit(cx, cy, rect, v) {
+  const s = viewScale(rect, v);
+  const ox = (rect.width - v.w * s) / 2, oy = (rect.height - v.h * s) / 2;
+  return { x: v.x + (cx - rect.left - ox) / s, y: v.y + (cy - rect.top - oy) / s };
+}
+function zoomAt(v, cx, cy, rect, k) {
+  const f = clientToUnit(cx, cy, rect, v);
+  const nw = clamp(v.w * k, MIN_W, MAX_W), r = nw / v.w, nh = v.h * r;
+  v.x = f.x - (f.x - v.x) * r; v.y = f.y - (f.y - v.y) * r; v.w = nw; v.h = nh;
+}
+function setupMap(container, svg, v) {
+  const pts = new Map(); let pinch = 0;
+  const apply = () => svg.setAttribute('viewBox', `${v.x.toFixed(2)} ${v.y.toFixed(2)} ${v.w.toFixed(2)} ${v.h.toFixed(2)}`);
+  const down = e => { try { container.setPointerCapture(e.pointerId); } catch {} pts.set(e.pointerId, { x: e.clientX, y: e.clientY }); if (pts.size === 2) { const [a, b] = [...pts.values()]; pinch = Math.hypot(a.x - b.x, a.y - b.y); } };
+  const move = e => {
+    if (!pts.has(e.pointerId)) return;
+    const prev = pts.get(e.pointerId); pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const rect = svg.getBoundingClientRect();
+    if (pts.size === 1) { const s = viewScale(rect, v); v.x -= (e.clientX - prev.x) / s; v.y -= (e.clientY - prev.y) / s; apply(); }
+    else if (pts.size === 2) { const [a, b] = [...pts.values()]; const d = Math.hypot(a.x - b.x, a.y - b.y); if (pinch > 0 && d > 0) { zoomAt(v, (a.x + b.x) / 2, (a.y + b.y) / 2, rect, pinch / d); apply(); } pinch = d; }
+  };
+  const up = e => { pts.delete(e.pointerId); if (pts.size < 2) pinch = 0; };
+  container.addEventListener('pointerdown', down);
+  container.addEventListener('pointermove', move);
+  container.addEventListener('pointerup', up);
+  container.addEventListener('pointercancel', up);
+  container.addEventListener('wheel', e => { e.preventDefault(); const rect = svg.getBoundingClientRect(); zoomAt(v, e.clientX, e.clientY, rect, e.deltaY > 0 ? 1.12 : 1 / 1.12); apply(); }, { passive: false });
+  return apply;
 }
 
 /* ---------- data load ---------- */
 async function loadData() {
   const caps = window.GEO_CAPITALS || {};
-  const res = await fetch('world.geojson?v=2');
+  const res = await fetch('world.geojson?v=3');
   const json = await res.json();
+  const raw = [];
   for (const f of json.features) {
     const p = f.properties;
     if (SKIP_CONTINENT.has(p.CONTINENT)) continue;
@@ -104,41 +150,77 @@ async function loadData() {
     code = code.toLowerCase();
     const aliases = new Set([p.NAME, p.NAME_LONG, p.NAME_EN, p.NAME_CIAWF, p.NAME_SORT].map(norm).filter(Boolean));
     (EXTRA_ALIASES[code] || []).forEach(a => aliases.add(norm(a)));
-    GEO.push({
-      code, name: p.NAME_LONG || p.NAME, region: p.CONTINENT,
-      aliases: [...aliases], cap: caps[code] || null, pop: +p.POP_EST || 0, geometry: f.geometry,
+    raw.push({
+      code, name: p.NAME_LONG || p.NAME, region: p.CONTINENT, aliases: [...aliases],
+      cap: caps[code] || null, pop: +p.POP_EST || 0, label: +p.LABELRANK || 5, geometry: f.geometry,
     });
   }
-  GEO.sort((a, b) => a.name.localeCompare(b.name));
+  // prominence: blend population (familiarity) + label prominence
+  const logs = raw.map(c => Math.log10(c.pop + 1));
+  const lo = Math.min(...logs), hi = Math.max(...logs), span = (hi - lo) || 1;
+  for (const c of raw) {
+    const normPop = (Math.log10(c.pop + 1) - lo) / span;
+    c.prom = W_POP * normPop + W_LABEL * (7 - c.label) / 5;
+  }
+  GEO = raw.sort((a, b) => a.name.localeCompare(b.name));
   byCode = Object.fromEntries(GEO.map(c => [c.code, c]));
   mapTemplate = buildMap();
 }
 
-/* ---------- highscores ---------- */
-const highs = () => { try { return JSON.parse(localStorage.getItem(HS_KEY)) || {}; } catch { return {}; } };
-const hsKey = () => `${S.mode}|${S.region}`;
+/* ---------- pools & difficulty ---------- */
+const regionList = () => S.region === 'All' ? GEO : GEO.filter(c => c.region === S.region);
+function applyDifficulty(list, diff) {
+  if (diff === 'All' || list.length < 3) return list;
+  const sorted = list.slice().sort((a, b) => b.prom - a.prom);   // most prominent first
+  const t = Math.ceil(sorted.length / 3);
+  if (diff === 'Easy') return sorted.slice(0, t);
+  if (diff === 'Medium') return sorted.slice(t, 2 * t);
+  return sorted.slice(2 * t);                                    // Hard
+}
+function pool() {
+  let list = regionList();
+  if (S.mode === 'capital') list = list.filter(c => c.cap);
+  return applyDifficulty(list, S.difficulty);
+}
+const learnPool = () => applyDifficulty(regionList(), S.difficulty);
+const matches = (typed, c) => { const t = norm(typed); return !!t && c.aliases.includes(t); };
+const optLabel = o => S.mode === 'capital' ? o.cap : o.name;
+
+/* ---------- persistence ---------- */
+const readJSON = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) || d; } catch { return d; } };
+const writeJSON = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+const highs = () => readJSON(HS_KEY, {});
+const hsKey = () => `${S.mode}|${S.region}|${S.difficulty}`;
 const getHigh = () => highs()[hsKey()] || 0;
-function saveHigh(score) { const h = highs(); const k = hsKey(); if (score > (h[k] || 0)) { h[k] = score; try { localStorage.setItem(HS_KEY, JSON.stringify(h)); } catch {} return true; } return false; }
+function saveHigh(score) { const h = highs(), k = hsKey(); if (score > (h[k] || 0)) { h[k] = score; writeJSON(HS_KEY, h); return true; } return false; }
+function bestForMode(mode) {
+  const h = highs(); let best = 0, ctx = '';
+  for (const [k, v] of Object.entries(h)) { const [m, r, d] = k.split('|'); if (m === mode && v > best) { best = v; ctx = (r || 'All') + (d && d !== 'All' ? ' · ' + d : ''); } }
+  return { best, ctx };
+}
+const mastery = () => readJSON(MASTERY_KEY, {});
+const masteredCount = () => Object.values(mastery()).filter(m => (m.box || 0) >= MASTER_BOX).length;
+function bumpStats() {
+  const s = readJSON(STATS_KEY, { games: 0, answered: 0, correct: 0, bestStreak: 0 });
+  s.games += 1; s.answered += S.answered; s.correct += S.correct; s.bestStreak = Math.max(s.bestStreak, S.bestStreak);
+  writeJSON(STATS_KEY, s);
+}
 
 /* ---------- game state ---------- */
 const S = {
-  screen: 'home', mode: 'mc', region: 'All',
+  screen: 'home', mode: 'mc', region: 'All', difficulty: 'All',
   queue: [], current: null, options: [], chosen: null, typed: '',
   lives: 3, streak: 0, bestStreak: 0, score: 0,
   correct: 0, answered: 0, total: 0, missed: [],
   locked: false, feedback: null, timeLeft: TIME_PER_Q, win: false,
   prevHigh: 0, newHigh: false,
+  fiftyLeft: FIFTY_PER_ROUND, fiftyUsedThisQ: false, hidden: [],
+  mapView: null, mapDefault: null,
+  learn: null,
   timer: null, advTimer: null,
 };
 const isMC = () => S.mode === 'mc' || S.mode === 'capital';
 const isTextEntry = () => S.mode === 'type' || S.mode === 'map';
-function pool() {
-  let list = S.region === 'All' ? GEO : GEO.filter(c => c.region === S.region);
-  if (S.mode === 'capital') list = list.filter(c => c.cap);
-  return list;
-}
-const matches = (typed, c) => { const t = norm(typed); return !!t && c.aliases.includes(t); };
-const optLabel = o => S.mode === 'capital' ? o.cap : o.name;
 
 function stopTimer() { if (S.timer) { clearInterval(S.timer); S.timer = null; } }
 function clearAdv() { if (S.advTimer) { clearTimeout(S.advTimer); S.advTimer = null; } }
@@ -147,8 +229,7 @@ function startTimer() {
   S.timer = setInterval(() => {
     if (S.locked) return;
     S.timeLeft--;
-    if (S.timeLeft <= 0) { S.timeLeft = 0; answer(false); }
-    else updateTimer();
+    if (S.timeLeft <= 0) { S.timeLeft = 0; answer(false); } else updateTimer();
   }, 1000);
 }
 
@@ -158,7 +239,7 @@ function start() {
   if (!q.length) return;
   Object.assign(S, {
     screen: 'play', queue: q, total: q.length, lives: 3, streak: 0,
-    bestStreak: 0, score: 0, correct: 0, answered: 0, missed: [], newHigh: false,
+    bestStreak: 0, score: 0, correct: 0, answered: 0, missed: [], newHigh: false, fiftyLeft: FIFTY_PER_ROUND,
   });
   loadNext();
 }
@@ -170,7 +251,8 @@ function loadNext() {
     const others = shuffle(GEO.filter(c => c.code !== current.code && (S.mode !== 'capital' || c.cap))).slice(0, 3);
     options = shuffle([current, ...others]);
   }
-  Object.assign(S, { current, options, chosen: null, typed: '', feedback: null, locked: false, timeLeft: TIME_PER_Q });
+  Object.assign(S, { current, options, chosen: null, typed: '', feedback: null, locked: false, timeLeft: TIME_PER_Q, fiftyUsedThisQ: false, hidden: [] });
+  if (S.mode === 'map') { const dv = frameView(current.geometry); S.mapDefault = dv; S.mapView = { ...dv }; }
   render();
   startTimer();
   if (isTextEntry()) setTimeout(() => { const i = $('.tinput'); if (i) i.focus(); }, 60);
@@ -178,19 +260,13 @@ function loadNext() {
 function answer(correct) {
   if (S.locked) return;
   stopTimer();
-  S.locked = true;
-  S.answered++;
+  S.locked = true; S.answered++;
   if (correct) {
-    S.score += 100 + S.timeLeft * 4 + S.streak * 10;
-    S.streak++;
-    S.bestStreak = Math.max(S.bestStreak, S.streak);
-    S.correct++;
+    S.score += S.fiftyUsedThisQ ? 50 : (100 + S.timeLeft * 4 + S.streak * 10);
+    S.streak++; S.bestStreak = Math.max(S.bestStreak, S.streak); S.correct++;
     S.feedback = { ok: true };
   } else {
-    S.lives--;
-    S.streak = 0;
-    S.missed.push(S.current);
-    S.feedback = { ok: false };
+    S.lives--; S.streak = 0; S.missed.push(S.current); S.feedback = { ok: false };
   }
   render();
   if (S.mode !== 'map') S.advTimer = setTimeout(() => { S.advTimer = null; next(); }, AUTO_ADVANCE_MS);
@@ -203,17 +279,20 @@ function next() {
 }
 function end(win) {
   stopTimer(); clearAdv();
-  S.prevHigh = getHigh();
-  S.newHigh = saveHigh(S.score);
-  S.win = win; S.screen = 'results';
-  render();
+  S.prevHigh = getHigh(); S.newHigh = saveHigh(S.score); bumpStats();
+  S.win = win; S.screen = 'results'; render();
 }
 function goHome() { stopTimer(); clearAdv(); S.screen = 'home'; S.locked = false; S.feedback = null; render(); }
+function goScores() { stopTimer(); clearAdv(); S.screen = 'scores'; render(); }
 
-const chooseMC = o => { if (S.locked) return; S.chosen = o.code; answer(o.code === S.current.code); };
+const chooseMC = o => { if (S.locked || S.hidden.includes(o.code)) return; S.chosen = o.code; answer(o.code === S.current.code); };
 const submitType = () => { if (S.locked || !S.typed.trim()) return; answer(matches(S.typed, S.current)); };
+function useFifty() {
+  if (!isMC() || S.locked || S.fiftyLeft <= 0 || S.hidden.length) return;
+  const wrong = shuffle(S.options.filter(o => o.code !== S.current.code).map(o => o.code)).slice(0, 2);
+  S.hidden = wrong; S.fiftyUsedThisQ = true; S.fiftyLeft--; render();
+}
 
-/* ---------- light updates during a question ---------- */
 function updateTimer() {
   const t = $('.pill.timer'); if (!t) return;
   const low = S.timeLeft <= 5;
@@ -222,12 +301,59 @@ function updateTimer() {
   const v = $('.timer-val'); if (v) v.textContent = S.timeLeft + 's';
 }
 
+/* ---------- learn mode (Leitner-style adaptive drill) ---------- */
+function startLearn() {
+  const codes = learnPool().map(c => c.code);
+  if (!codes.length) return;
+  const m = mastery();
+  const boxes = {};
+  for (const c of codes) boxes[c] = (m[c] && m[c].box) || 0;
+  const remaining = codes.filter(c => boxes[c] < MASTER_BOX).sort((a, b) => byCode[b].prom - byCode[a].prom); // famous first
+  S.learn = { codes, boxes, dueAt: {}, queue: remaining, active: new Set(), step: 0, current: null, revealed: false, typed: '', graded: null, override: null, done: false };
+  S.screen = 'learn';
+  learnPick();
+  render();
+}
+function learnPick() {
+  const L = S.learn;
+  const inPlay = c => L.active.has(c) && L.boxes[c] < MASTER_BOX;
+  let due = [...L.active].filter(c => inPlay(c) && (L.dueAt[c] || 0) <= L.step);
+  if (!due.length && L.active.size < LEARN_ACTIVE && L.queue.length) {
+    const c = L.queue.shift(); L.active.add(c); L.dueAt[c] = L.step; due = [c];
+  }
+  if (!due.length) due = [...L.active].filter(inPlay);
+  if (!due.length) { L.done = true; L.current = null; return; }
+  due.sort((a, b) => (L.boxes[a] - L.boxes[b]) || ((L.dueAt[a] || 0) - (L.dueAt[b] || 0)));
+  L.current = due[0]; L.revealed = false; L.typed = ''; L.graded = null; L.override = null;
+}
+function learnReveal(correct) {
+  const L = S.learn;
+  L.graded = correct != null ? correct : matches(L.typed, byCode[L.current]);
+  L.revealed = true; render();
+}
+function learnNext() {
+  const L = S.learn, c = L.current;
+  const ok = L.override != null ? L.override : L.graded;
+  L.boxes[c] = ok ? Math.min(MASTER_BOX, L.boxes[c] + 1) : Math.max(0, L.boxes[c] - 2);
+  const m = mastery(); m[c] = { box: L.boxes[c], lastSeen: Date.now(), seen: ((m[c] && m[c].seen) || 0) + 1 }; writeJSON(MASTERY_KEY, m);
+  if (L.boxes[c] >= MASTER_BOX) L.active.delete(c);
+  else L.dueAt[c] = L.step + LEARN_INTERVALS[Math.min(L.boxes[c], LEARN_INTERVALS.length - 1)];
+  L.step++;
+  learnPick(); render();
+}
+
 /* ---------- render ---------- */
 const app = () => $('#app');
 function render() {
   const root = app();
   root.innerHTML = '';
-  root.append(S.screen === 'home' ? Home() : S.screen === 'play' ? Play() : Results());
+  const v = { home: Home, play: Play, results: Results, scores: Scores, learn: Learn }[S.screen];
+  root.append(v());
+}
+
+function chipRow(label, items, sel, onPick) {
+  return [el('div', { class: 'label' }, label),
+  el('div', { class: 'chips' }, items.map(r => el('div', { class: 'chip tap' + (sel === r ? ' on' : ''), onclick: () => onPick(r) }, r)))];
 }
 
 function Home() {
@@ -245,39 +371,34 @@ function Home() {
   $('.map', hero).append(worldMap());
 
   const seg = el('div', { class: 'segment' },
-    Object.entries(MODES).map(([k, lbl]) =>
-      el('div', { class: 'seg tap' + (S.mode === k ? ' on' : ''), onclick: () => { S.mode = k; render(); } }, lbl)));
-
-  const chips = el('div', { class: 'chips' },
-    REGIONS.map(r => el('div', {
-      class: 'chip tap' + (S.region === r ? ' on' : ''),
-      onclick: () => { S.region = r; render(); }
-    }, r === 'All' ? 'All' : r)));
+    Object.entries(MODES).map(([k, lbl]) => el('div', { class: 'seg tap' + (S.mode === k ? ' on' : ''), onclick: () => { S.mode = k; render(); } }, lbl)));
 
   const count = pool().length;
   const best = getHigh();
   const sheet = el('div', { class: 'sheet scroll' }, [
     seg,
-    el('div', { class: 'label' }, 'REGION'),
-    chips,
+    ...chipRow('REGION', REGIONS, S.region, r => { S.region = r; render(); }),
+    ...chipRow('DIFFICULTY', DIFFS, S.difficulty, d => { S.difficulty = d; render(); }),
     el('div', { class: 'spacer' }),
     el('div', { class: 'hsbar' }, [
       el('div', { class: 'crown', html: '<svg viewBox="0 0 24 24" width="16" height="16" fill="#FF8A3D"><path d="M3 7l4.5 4L12 4l4.5 7L21 7l-2 12H5L3 7z"/></svg>' }),
       el('div', { class: 'meta' }, [
         el('b', {}, best ? best.toLocaleString('en-US') : 'No score yet'),
-        el('span', {}, `BEST · ${MODES[S.mode].toUpperCase()} · ${(S.region === 'All' ? 'ALL' : S.region).toUpperCase()}`),
+        el('span', {}, `BEST · ${MODES[S.mode].toUpperCase()} · ${(S.region === 'All' ? 'ALL' : S.region).toUpperCase()} · ${S.difficulty.toUpperCase()}`),
       ]),
     ]),
     el('div', { class: 'poolline' }, [
       el('span', { html: icon('<path d="M12 21s7-6 7-11a7 7 0 10-14 0c0 5 7 11 7 11z"/><circle cx="12" cy="10" r="2.4"/>'), style: 'width:15px;height:15px;display:inline-flex' }),
-      `${S.region === 'All' ? 'All regions' : S.region} · ${count} countries`,
+      `${count} countries`,
     ]),
-    el('button', { class: 'play tap', onclick: start }, [
-      el('span', { html: '<svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M8 5v14l11-7z"/></svg>', style: 'display:inline-flex' }),
-      'Play',
+    el('button', { class: 'play tap', onclick: start, disabled: count ? null : '' }, [
+      el('span', { html: '<svg viewBox="0 0 24 24" width="18" height="18" fill="#fff"><path d="M8 5v14l11-7z"/></svg>', style: 'display:inline-flex' }), 'Play',
+    ]),
+    el('div', { class: 'secrow' }, [
+      el('button', { class: 'secbtn tap', onclick: startLearn }, '📚 Learn'),
+      el('button', { class: 'secbtn tap', onclick: goScores }, '🏆 Scores'),
     ]),
   ]);
-
   return el('div', { class: 'home' }, [hero, sheet]);
 }
 
@@ -289,10 +410,8 @@ function Play() {
 }
 
 function Hud() {
-  const hearts = el('div', { class: 'hearts' },
-    [0, 1, 2].map(i => el('span', {
-      html: `<svg viewBox="0 0 24 24" width="17" height="17" fill="${i < S.lives ? '#FF5670' : '#E2D6DC'}"><path d="M12 21s-7-4.6-9.3-9C1.2 8.9 2.7 5.4 6.2 5.4c2 0 3.2 1.2 3.8 2.2.6-1 1.8-2.2 3.8-2.2 3.5 0 5 3.5 3.5 6.6C19 16.4 12 21 12 21z"/></svg>`
-    })));
+  const hearts = el('div', { class: 'hearts' }, [0, 1, 2].map(i => el('span', {
+    html: `<svg viewBox="0 0 24 24" width="17" height="17" fill="${i < S.lives ? '#FF5670' : '#E2D6DC'}"><path d="M12 21s-7-4.6-9.3-9C1.2 8.9 2.7 5.4 6.2 5.4c2 0 3.2 1.2 3.8 2.2.6-1 1.8-2.2 3.8-2.2 3.5 0 5 3.5 3.5 6.6C19 16.4 12 21 12 21z"/></svg>` })));
   const pct = S.total ? Math.round((S.answered / S.total) * 100) : 0;
   const low = S.timeLeft <= 5;
   return el('div', { class: 'hud' }, [
@@ -303,10 +422,7 @@ function Hud() {
     ]),
     el('div', { class: 'stats' }, [
       el('div', { style: 'display:flex;align-items:center;gap:8px' }, [
-        el('div', { class: 'pill streak' }, [
-          el('span', { html: '<svg viewBox="0 0 24 24" width="13" height="13" fill="#FF8A3D"><path d="M12 2c1 3-1.5 4.5-1.5 7 0 1.4 1 2.4 1.5 3 .5-.8 1-1.6 1-2.6 2 1.6 3 3.6 3 5.6a6 6 0 11-12 0c0-3 2-5 4-7 .4 2 .6 3 .6 3S12 6 12 2z"/></svg>', style: 'display:inline-flex' }),
-          String(S.streak),
-        ]),
+        el('div', { class: 'pill streak' }, [el('span', { html: '<svg viewBox="0 0 24 24" width="13" height="13" fill="#FF8A3D"><path d="M12 2c1 3-1.5 4.5-1.5 7 0 1.4 1 2.4 1.5 3 .5-.8 1-1.6 1-2.6 2 1.6 3 3.6 3 5.6a6 6 0 11-12 0c0-3 2-5 4-7 .4 2 .6 3 .6 3S12 6 12 2z"/></svg>', style: 'display:inline-flex' }), String(S.streak)]),
         el('div', { class: 'pill pts' }, [el('span', {}, 'PTS'), el('b', {}, String(S.score))]),
       ]),
       el('div', { class: 'pill timer', style: `background:${low ? 'var(--redbg)' : '#fff'};color:${low ? '#C2334B' : '#9B5DE5'}` }, [
@@ -325,60 +441,55 @@ function FlagStage() {
     el('div', { class: 'prompt' }, promptText),
   ]);
   if (isMC()) {
+    if (!S.locked) stage.append(el('div', { class: 'fiftyrow' },
+      el('button', { class: 'fifty tap' + (S.fiftyLeft && !S.hidden.length ? '' : ' dis'), onclick: useFifty },
+        `50:50 · ${S.fiftyLeft} left`)));
     stage.append(el('div', { class: 'grid2' }, S.options.map(o => {
       let cls = 'opt tap';
-      if (S.locked) {
-        if (o.code === S.current.code) cls = 'opt right';
-        else if (o.code === S.chosen) cls = 'opt wrong';
-        else cls = 'opt dim';
-      }
+      if (S.hidden.includes(o.code)) cls = 'opt gone';
+      else if (S.locked) cls = o.code === S.current.code ? 'opt right' : o.code === S.chosen ? 'opt wrong' : 'opt dim';
       return el('div', { class: cls, onclick: () => chooseMC(o) }, optLabel(o));
     })));
-  } else {
-    stage.append(TypeInput('typebox'));
-  }
+  } else stage.append(TypeInput('typebox'));
   return stage;
 }
 
 function MapStage() {
   const stage = el('div', { class: 'mapstage' });
-  stage.append(worldMap({ highlight: S.current.code, zoom: true }));
+  const svg = worldMap({ highlight: S.current.code, view: S.mapView });
+  stage.append(svg);
+  const apply = setupMap(stage, svg, S.mapView);
+  const center = () => { const r = svg.getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height / 2, r]; };
+  stage.append(el('div', { class: 'zoomctl' }, [
+    el('button', { class: 'zbtn tap', onclick: () => { const [x, y, r] = center(); zoomAt(S.mapView, x, y, r, 0.7); apply(); } }, '+'),
+    el('button', { class: 'zbtn tap', onclick: () => { const [x, y, r] = center(); zoomAt(S.mapView, x, y, r, 1 / 0.7); apply(); } }, '−'),
+    el('button', { class: 'zbtn tap', onclick: () => { Object.assign(S.mapView, S.mapDefault); apply(); }, html: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9V5a2 2 0 012-2h4M21 9V5a2 2 0 00-2-2h-4M3 15v4a2 2 0 002 2h4M21 15v4a2 2 0 01-2 2h-4"/></svg>' }),
+  ]));
   return stage;
 }
 
 function TypeInput(wrapClass) {
-  const ok = S.locked && S.feedback && S.feedback.ok;
-  const no = S.locked && S.feedback && !S.feedback.ok;
+  const ok = S.locked && S.feedback && S.feedback.ok, no = S.locked && S.feedback && !S.feedback.ok;
   const input = el('input', {
-    class: 'tinput' + (ok ? ' ok' : no ? ' no' : ''),
-    value: S.typed, placeholder: 'Type the country…', disabled: S.locked ? '' : null,
-    oninput: e => S.typed = e.target.value,
-    onkeydown: e => { if (e.key === 'Enter') submitType(); },
+    class: 'tinput' + (ok ? ' ok' : no ? ' no' : ''), value: S.typed, placeholder: 'Type the country…', disabled: S.locked ? '' : null,
+    oninput: e => S.typed = e.target.value, onkeydown: e => { if (e.key === 'Enter') submitType(); },
   });
-  const btn = el('button', { class: 'checkbtn tap' + (S.locked ? ' dis' : ''), onclick: submitType }, 'Check answer');
-  return el('div', { class: wrapClass }, [input, btn]);
+  return el('div', { class: wrapClass }, [input, el('button', { class: 'checkbtn tap' + (S.locked ? ' dis' : ''), onclick: submitType }, 'Check answer')]);
 }
 
 function ActionBar() {
   const bar = el('div', { class: 'actionbar' });
   if (S.mode === 'map' && !S.locked) {
-    const input = el('input', {
-      class: 'tinput', value: S.typed, placeholder: 'Name this country…',
-      oninput: e => S.typed = e.target.value,
-      onkeydown: e => { if (e.key === 'Enter') submitType(); },
-    });
+    const input = el('input', { class: 'tinput', value: S.typed, placeholder: 'Name this country…', oninput: e => S.typed = e.target.value, onkeydown: e => { if (e.key === 'Enter') submitType(); } });
     bar.append(el('div', { class: 'maprow' }, [input, el('button', { class: 'gobtn tap', onclick: submitType }, 'Go')]));
   }
   if (S.locked) {
-    const fb = S.feedback;
-    const color = fb.ok ? '#16A34A' : '#C2334B';
-    const c = S.current;
+    const fb = S.feedback, color = fb.ok ? '#16A34A' : '#C2334B', c = S.current;
     const txt = el('div', { class: 'txt' }, el('b', {}, fb.ok ? 'Correct!' : (S.mode === 'capital' ? `It’s ${c.cap}` : `It was ${c.name}`)));
     if (S.mode === 'map') txt.append(el('small', {}, `${c.name} · Capital: ${c.cap || '—'} · ${fmtPop(c.pop)} people`));
     bar.append(el('div', { class: 'feedback ' + (fb.ok ? 'right' : 'wrong') }, [
       txt,
-      el('button', { class: 'nextbtn tap', style: `background:${color}`, onclick: next },
-        S.lives <= 0 ? 'See results' : S.queue.length === 0 ? 'Finish' : 'Next'),
+      el('button', { class: 'nextbtn tap', style: `background:${color}`, onclick: next }, S.lives <= 0 ? 'See results' : S.queue.length === 0 ? 'Finish' : 'Next'),
     ]));
   }
   return bar;
@@ -389,7 +500,7 @@ function Results() {
   const kids = [
     el('div', { class: 'resbadge', style: S.win ? 'background:#FFF7E0;color:#E6A700' : 'background:#FFE9EC;color:#C2334B' }, S.win ? '★' : '✕'),
     el('div', { class: 'restitle' }, S.win ? 'Round complete!' : 'Game over'),
-    el('div', { class: 'ressub' }, `${MODES[S.mode]} · ${S.region}`),
+    el('div', { class: 'ressub' }, `${MODES[S.mode]} · ${S.region} · ${S.difficulty}`),
   ];
   if (S.newHigh) kids.push(el('div', { class: 'newhighwrap' }, el('div', { class: 'newhigh' }, '🏆 New high score!')));
   kids.push(
@@ -402,17 +513,101 @@ function Results() {
       el('div', { class: 'l' }, `${S.correct} of ${S.total} correct`),
       el('div', { class: 'r' }, S.missed.length ? `${S.missed.length} missed` : 'Flawless!'),
     ]),
-    el('div', { class: 'missedlist scroll' }, S.missed.map(c =>
-      el('div', { class: 'missrow' }, [
-        el('div', { class: 'mf' }, el('img', { src: flag(c.code, 160), alt: '' })),
-        el('b', {}, S.mode === 'capital' ? `${c.name} — ${c.cap}` : c.name),
-      ]))),
+    el('div', { class: 'missedlist scroll' }, S.missed.map(c => el('div', { class: 'missrow' }, [
+      el('div', { class: 'mf' }, el('img', { src: flag(c.code, 160), alt: '' })),
+      el('b', {}, S.mode === 'capital' ? `${c.name} — ${c.cap}` : c.name),
+    ]))),
     el('div', { class: 'resbtns' }, [
       el('button', { class: 'homebtn tap', onclick: goHome, html: '<svg width="20" height="20" viewBox="0 0 24 24" fill="#5046E5"><path d="M3 11l9-8 9 8v9a1 1 0 01-1 1h-5v-6h-6v6H4a1 1 0 01-1-1z"/></svg>' }),
+      el('button', { class: 'homebtn tap', onclick: goScores, html: '<svg width="20" height="20" viewBox="0 0 24 24" fill="#FF8A3D"><path d="M3 7l4.5 4L12 4l4.5 7L21 7l-2 12H5L3 7z"/></svg>' }),
       el('button', { class: 'againbtn tap', onclick: start }, 'Play again'),
     ]),
   );
   return el('div', { class: 'results' }, kids);
+}
+
+function Scores() {
+  const st = readJSON(STATS_KEY, { games: 0, answered: 0, correct: 0, bestStreak: 0 });
+  const acc = st.answered ? Math.round((st.correct / st.answered) * 100) : 0;
+  const rows = Object.entries(MODES).map(([k, lbl]) => {
+    const { best, ctx } = bestForMode(k);
+    return el('div', { class: 'scorerow' }, [
+      el('div', { class: 'sm' }, lbl),
+      el('div', { class: 'sv' }, [el('b', {}, best ? best.toLocaleString('en-US') : '—'), el('span', {}, best ? ctx : 'not played')]),
+    ]);
+  });
+  return el('div', { class: 'results' }, [
+    el('div', { class: 'scoreshead' }, [
+      el('button', { class: 'iconbtn tap', onclick: goHome, html: '<svg width="8" height="14" viewBox="0 0 9 16" fill="none" stroke="#5046E5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 1L1 8l6 7"/></svg>' }),
+      el('div', { class: 'restitle', style: 'margin:0' }, 'Your scores'),
+      el('div', { style: 'width:34px' }),
+    ]),
+    el('div', { class: 'statcards', style: 'margin-top:16px' }, [
+      el('div', { class: 'statcard sc-p' }, [el('b', {}, String(st.games)), el('span', {}, 'GAMES')]),
+      el('div', { class: 'statcard sc-g' }, [el('b', {}, acc + '%'), el('span', {}, 'ACCURACY')]),
+      el('div', { class: 'statcard sc-o' }, [el('b', {}, `${masteredCount()}/${GEO.length}`), el('span', {}, 'MASTERED')]),
+    ]),
+    el('div', { class: 'label', style: 'margin:20px 0 4px' }, 'BEST PER MODE'),
+    el('div', { class: 'scorelist scroll' }, rows),
+    el('div', { class: 'resbtns' }, [
+      el('button', { class: 'homebtn tap', onclick: goHome, html: '<svg width="20" height="20" viewBox="0 0 24 24" fill="#5046E5"><path d="M3 11l9-8 9 8v9a1 1 0 01-1 1h-5v-6h-6v6H4a1 1 0 01-1-1z"/></svg>' }),
+      el('button', { class: 'againbtn tap', onclick: startLearn }, '📚 Learn weak spots'),
+    ]),
+  ]);
+}
+
+function Learn() {
+  const L = S.learn;
+  const total = L.codes.length;
+  const mastered = L.codes.filter(c => L.boxes[c] >= MASTER_BOX).length;
+  const pct = total ? Math.round((mastered / total) * 100) : 0;
+  const head = el('div', { class: 'learnhead' }, [
+    el('button', { class: 'iconbtn tap', onclick: goHome, html: '<svg width="8" height="14" viewBox="0 0 9 16" fill="none" stroke="#5046E5" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 1L1 8l6 7"/></svg>' }),
+    el('div', { class: 'learnprog' }, [el('div', { class: 'bar' }, el('i', { style: `width:${pct}%` })), el('span', {}, `${mastered}/${total} mastered`)]),
+  ]);
+
+  if (L.done) {
+    return el('div', { class: 'learn' }, [head, el('div', { class: 'learndone' }, [
+      el('div', { class: 'resbadge', style: 'background:#FFF7E0;color:#E6A700' }, '★'),
+      el('div', { class: 'restitle' }, 'All mastered!'),
+      el('div', { class: 'ressub' }, `${total} countries · ${S.region} · ${S.difficulty}`),
+      el('div', { class: 'resbtns', style: 'margin-top:18px' }, [
+        el('button', { class: 'homebtn tap', onclick: goHome, html: '<svg width="20" height="20" viewBox="0 0 24 24" fill="#5046E5"><path d="M3 11l9-8 9 8v9a1 1 0 01-1 1h-5v-6h-6v6H4a1 1 0 01-1-1z"/></svg>' }),
+        el('button', { class: 'againbtn tap', onclick: startLearn }, 'Restart'),
+      ]),
+    ])]);
+  }
+
+  const c = byCode[L.current];
+  const card = el('div', { class: 'learncard scroll' }, [el('div', { class: 'flagcard' }, el('img', { src: flag(c.code, 640), alt: 'flag' }))]);
+  if (!L.revealed) {
+    card.append(el('div', { class: 'prompt' }, 'Which country is this?'));
+    const input = el('input', { class: 'tinput', value: L.typed, placeholder: 'Type the country…', oninput: e => L.typed = e.target.value, onkeydown: e => { if (e.key === 'Enter') learnReveal(); } });
+    card.append(el('div', { class: 'typebox' }, [input,
+      el('div', { class: 'learnbtns' }, [
+        el('button', { class: 'checkbtn tap', style: 'flex:1', onclick: () => learnReveal() }, 'Check'),
+        el('button', { class: 'showbtn tap', onclick: () => learnReveal(false) }, 'Show'),
+      ])]));
+    setTimeout(() => input.focus(), 60);
+  } else {
+    const ok = L.override != null ? L.override : L.graded;
+    card.append(el('div', { class: 'reveal ' + (ok ? 'right' : 'wrong') }, [
+      el('div', { class: 'rvname' }, c.name),
+      el('div', { class: 'rvgrid' }, [
+        el('div', {}, [el('span', {}, 'CAPITAL'), el('b', {}, c.cap || '—')]),
+        el('div', {}, [el('span', {}, 'POPULATION'), el('b', {}, fmtPop(c.pop))]),
+        el('div', {}, [el('span', {}, 'REGION'), el('b', {}, c.region)]),
+        el('div', {}, [el('span', {}, 'RESULT'), el('b', {}, ok ? '✓ knew it' : '✗ review')]),
+      ]),
+    ]));
+    const mini = el('div', { class: 'minimap' }); mini.append(worldMap({ highlight: c.code, view: frameView(c.geometry, 1.8, 110) }));
+    card.append(mini);
+    card.append(el('div', { class: 'learnbtns' }, [
+      el('button', { class: 'showbtn tap', onclick: () => { L.override = !ok; render(); } }, ok ? 'Mark wrong' : 'I knew it'),
+      el('button', { class: 'checkbtn tap', style: 'flex:1', onclick: learnNext }, 'Next →'),
+    ]));
+  }
+  return el('div', { class: 'learn' }, [head, card]);
 }
 
 /* ---------- boot ---------- */
