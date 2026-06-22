@@ -598,5 +598,21 @@ function Learn() {
   return el('div', { class: 'learn' }, [head, card]);
 }
 
+/* prime the flag cache once (online) so the game works fully offline afterwards */
+function prefetchFlags() {
+  try {
+    if (!('serviceWorker' in navigator) || !navigator.onLine || localStorage.getItem('geomaster.flagsCached')) return;
+  } catch { return; }
+  const urls = [];
+  for (const c of GEO) { urls.push(flag(c.code, 640)); urls.push(flag(c.code, 160)); }
+  let i = 0;
+  const tick = () => {
+    for (let n = 0; n < 6 && i < urls.length; n++, i++) { const im = new Image(); im.src = urls[i]; }
+    if (i < urls.length) setTimeout(tick, 350);
+    else { try { localStorage.setItem('geomaster.flagsCached', '1'); } catch {} }
+  };
+  setTimeout(tick, 2500);   // let the first screen settle first
+}
+
 /* ---------- boot ---------- */
-loadData().then(render).catch(err => { app().innerHTML = `<div class="loading">Couldn't load map data.<br><small>${err.message}</small></div>`; });
+loadData().then(() => { render(); prefetchFlags(); }).catch(err => { app().innerHTML = `<div class="loading">Couldn't load map data.<br><small>${err.message}</small></div>`; });
